@@ -9,15 +9,16 @@ import pystray
 from PIL import Image, ImageDraw, ImageTk
 
 from .config import (
-    ACCENT_NEW, ACCENT_UPD, BG, CARD_BG,
+    ACCENT_NEW, ACCENT_UPD, BG, CARD_BG, CARD_HOVER,
     CATEGORY_COLOR_DEFAULT, CATEGORY_COLORS,
     CHECK_INTERVAL_MINUTES,
+    DEFAULT_TARGET_SPT_VERSION,
     DISPLAY_FIELDS, FORGE_MOD_PAGE, FORGE_URL, MAX_PER_CATEGORY,
     SEPARATOR, STATE_FIELDS, STATUS_BG, TEXT, TEXT_BRIGHT, TEXT_DIM,
     UPDATE_CHECK_INTERVAL_HOURS,
     WINDOW_DEFAULT_GEOMETRY, WINDOW_MIN_HEIGHT, WINDOW_MIN_WIDTH,
 )
-from .feed import ForgeBlocked, fetch_feeds, unpublished_links
+from .feed import ForgeBlocked, fetch_feeds, list_known_spt_versions, unpublished_links
 from .localmods import detect_spt_version, scan_installed_mods
 from .matcher import match_local_mods
 from .platform import (
@@ -32,6 +33,12 @@ from .update import check_for_update
 from .widgets import LocalScanSettingsWindow, ModCard, StatsWindow, flat_button
 
 _ICON_SUPERSAMPLE = 4
+
+# Dropdown entry representing "no version filter" -- a display label, not a
+# real version string; translated to/from the stored empty-string value at
+# the UI boundary (_on_version_picked, _refresh_version_choices) so the rest
+# of the app (state, feed.py) only ever deals with "" or a real version.
+_UNFILTERED_CHOICE = "All versions (unfiltered)"
 
 
 def _render_info_icon(color, size=16):
@@ -91,6 +98,9 @@ class SPTCheckerApp:
         self._tray = None
         self._unread_count = 0
         self._visible = not start_hidden
+        self._last_target_version = None
+        self._last_version_source = "manual"
+        self._last_known_versions = []
         startup_on = is_startup_enabled()
         self._startup_var = tk.BooleanVar(value=startup_on)
         try:
@@ -144,6 +154,54 @@ class SPTCheckerApp:
         flat_button(hdr, "Stats", self._show_stats).pack(side="left", padx=(6, 0))
         flat_button(hdr, "Local Mods", self._show_local_scan).pack(side="left", padx=(6, 0))
 
+        # ── SPT version filter picker ────────────────────────────────────
+        ver_frame = tk.Frame(hdr, bg=BG)
+        ver_frame.pack(side="left", padx=(12, 0))
+        tk.Label(ver_frame, text="SPT:", font=("Segoe UI", 8),
+                 fg=TEXT_DIM, bg=BG).pack(side="left")
+
+        stored = self.state.get("target_spt_version", DEFAULT_TARGET_SPT_VERSION).strip()
+        self._target_version_var = tk.StringVar(value=stored or _UNFILTERED_CHOICE)
+        # Seeded with just the stored choice until the first live check
+        # populates the real list (_refresh_version_choices) -- a dropdown
+        # needs *some* menu to build before that first fetch completes.
+        self._version_menu = tk.OptionMenu(
+            ver_frame, self._target_version_var, self._target_version_var.get(),
+        )
+        self._version_menu.configure(
+            font=("Segoe UI", 8), bg=CARD_BG, fg=TEXT_BRIGHT,
+            activebackground=CARD_HOVER, activeforeground=TEXT_BRIGHT,
+            relief="flat", highlightthickness=0, padx=6, pady=1, cursor="hand2",
+        )
+        self._version_menu["menu"].configure(
+            bg=CARD_BG, fg=TEXT_BRIGHT,
+            activebackground=CARD_HOVER, activeforeground=TEXT_BRIGHT,
+        )
+        self._version_menu.pack(side="left", padx=(4, 4))
+        self._bind_tooltip(
+            self._version_menu,
+            "Only show mods with a version compatible with the chosen SPT\n"
+            "server version. Choices are read live from the Forge's own\n"
+            "currently-published mods -- only ever versions mods actually\n"
+            "support right now, never a stale hardcoded list.",
+        )
+
+        self._auto_detect_var = tk.BooleanVar(
+            value=self.state.get("auto_detect_spt_version", False))
+        auto_chk = tk.Checkbutton(
+            ver_frame, text="auto", font=("Segoe UI", 8),
+            fg=TEXT_DIM, bg=BG, selectcolor=CARD_BG,
+            activebackground=BG, activeforeground=TEXT,
+            variable=self._auto_detect_var, command=self._toggle_auto_detect,
+        )
+        auto_chk.pack(side="left")
+        self._bind_tooltip(
+            auto_chk,
+            "Detect the target version from your Local Mods install folder\n"
+            "(reads SPT.Server.exe) instead of the version picked at left.",
+        )
+        self._version_menu.configure(state="disabled" if self._auto_detect_var.get() else "normal")
+
         self._btn = flat_button(hdr, "Check Now", self._check_now)
         self._btn.pack(side="right")
         self._tooltip_id = None
@@ -163,22 +221,40 @@ class SPTCheckerApp:
         body.columnconfigure(0, weight=1, uniform="col")
         body.columnconfigure(2, weight=1, uniform="col")
 
-        tk.Label(body, text="● NEW MODS", font=("Segoe UI", 10, "bold"),
-                 fg=ACCENT_NEW, bg=BG, anchor="w").grid(row=0, column=0, sticky="w", pady=(0, 3))
+        new_hdr = tk.Frame(body, bg=BG)
+        new_hdr.grid(row=0, column=0, sticky="w", pady=(0, 3))
+        tk.Label(new_hdr, text="● NEW MODS", font=("Segoe UI", 10, "bold"),
+                 fg=ACCENT_NEW, bg=BG, anchor="w").pack(side="left")
+        # Text is set by _update_filter_labels once the target version is
+        # resolved (which reads SPT.Server.exe when auto-detect is on, so it
+        # isn't known for certain until then) -- empty until the first check.
+        self._new_filter_lbl = tk.Label(new_hdr, text="", font=("Segoe UI", 8),
+                                        fg=TEXT_DIM, bg=BG, anchor="w")
+        self._new_filter_lbl.pack(side="left")
         self._new_frame = tk.Frame(body, bg=BG)
         self._new_frame.grid(row=1, column=0, sticky="nsew")
 
         tk.Frame(body, bg=SEPARATOR, width=1).grid(
             row=0, column=1, rowspan=2, sticky="ns", padx=8)
 
-        tk.Label(body, text="● UPDATED MODS", font=("Segoe UI", 10, "bold"),
-                 fg=ACCENT_UPD, bg=BG, anchor="w").grid(row=0, column=2, sticky="w", pady=(0, 3))
+        upd_hdr = tk.Frame(body, bg=BG)
+        upd_hdr.grid(row=0, column=2, sticky="w", pady=(0, 3))
+        tk.Label(upd_hdr, text="● UPDATED MODS", font=("Segoe UI", 10, "bold"),
+                 fg=ACCENT_UPD, bg=BG, anchor="w").pack(side="left")
+        self._upd_filter_lbl = tk.Label(upd_hdr, text="", font=("Segoe UI", 8),
+                                        fg=TEXT_DIM, bg=BG, anchor="w")
+        self._upd_filter_lbl.pack(side="left")
         self._upd_frame = tk.Frame(body, bg=BG)
         self._upd_frame.grid(row=1, column=2, sticky="nsew")
         body.rowconfigure(1, weight=1)
 
         self._set_placeholder(self._new_frame, "Checking…")
         self._set_placeholder(self._upd_frame, "Checking…")
+
+        # Seed the filter labels immediately (a fast local file read at
+        # worst) rather than leaving them blank for the second or two before
+        # the first background check reports back.
+        self._update_filter_labels(*self._resolve_target_spt_version())
 
         bar = tk.Frame(self.root, bg=STATUS_BG, pady=3)
         bar.pack(fill="x", side="bottom")
@@ -298,6 +374,76 @@ class SPTCheckerApp:
         stats = compute_stats(self.state.get("mods", {}))
         StatsWindow(self.root, stats)
 
+    # ── SPT version filter ──────────────────────────────────────────────
+
+    def _resolve_target_spt_version(self):
+        """What SPT version should the feed be filtered against right now,
+        and where did that answer come from -- "manual" (the typed value),
+        "auto" (read live from the Local Mods install folder), or
+        "auto-fallback" (auto-detect is on but couldn't read a version, so
+        the typed value is being used anyway). Reading the exe's version
+        resource is a fast local file read, not a network call, so this is
+        cheap enough to call on every check.
+        """
+        manual = self.state.get("target_spt_version", DEFAULT_TARGET_SPT_VERSION).strip()
+        if self.state.get("auto_detect_spt_version"):
+            path = self.state.get("spt_install_path", "")
+            detected = detect_spt_version(path) if path else None
+            if detected:
+                return detected, "auto"
+            return manual, "auto-fallback"
+        return manual, "manual"
+
+    def _update_filter_labels(self, version, source):
+        if not version:
+            text = ""
+        elif source == "auto":
+            text = f"  (SPT {version} · auto)"
+        elif source == "auto-fallback":
+            text = f"  (SPT {version} · auto-detect unavailable)"
+        else:
+            text = f"  (SPT {version})"
+        self._new_filter_lbl.configure(text=text)
+        self._upd_filter_lbl.configure(text=text)
+
+    def _select_version(self, choice):
+        """Menu command for one dropdown entry -- sets the displayed choice
+        and applies it. Bound per-entry in _refresh_version_choices rather
+        than via OptionMenu's own `command=` callback so it also fires for
+        entries added after construction."""
+        self._target_version_var.set(choice)
+        value = "" if choice == _UNFILTERED_CHOICE else choice
+        if value == self.state.get("target_spt_version", DEFAULT_TARGET_SPT_VERSION):
+            return
+        self.state["target_spt_version"] = value
+        save_state(self.state)
+        if not self._auto_detect_var.get():
+            self._check_now()
+
+    def _toggle_auto_detect(self):
+        enabled = self._auto_detect_var.get()
+        self.state["auto_detect_spt_version"] = enabled
+        save_state(self.state)
+        self._version_menu.configure(state="disabled" if enabled else "normal")
+        self._check_now()
+
+    def _refresh_version_choices(self, versions):
+        """Rebuild the picker's dropdown from a live list of SPT versions
+        (newest first, as returned by feed.list_known_spt_versions) --
+        called after every check. Keeps the current selection in the list
+        even if it's since dropped off the live data (e.g. no mod currently
+        declares it), so a deliberate pick never silently reverts out from
+        under the user just because nothing recent still supports it.
+        """
+        current = self._target_version_var.get()
+        choices = [_UNFILTERED_CHOICE] + list(versions)
+        if current not in choices:
+            choices.append(current)
+        menu = self._version_menu["menu"]
+        menu.delete(0, "end")
+        for choice in choices:
+            menu.add_command(label=choice, command=lambda c=choice: self._select_version(c))
+
     # ── Local mod scan (opt-in) ───────────────────────────────────────
 
     def _show_local_scan(self):
@@ -328,6 +474,8 @@ class SPTCheckerApp:
     def _set_local_scan_path(self, path):
         self.state["spt_install_path"] = path
         save_state(self.state)
+        if self._auto_detect_var.get():
+            self._check_now()
 
     def _scan_local_now(self):
         if self._scanning:
@@ -494,7 +642,14 @@ class SPTCheckerApp:
 
     def _bg_check(self):
         try:
-            newest, updated = fetch_feeds()
+            target_version, version_source = self._resolve_target_spt_version()
+            self._last_target_version = target_version
+            self._last_version_source = version_source
+            newest, updated = fetch_feeds(target_spt_version=target_version)
+            # Fail-soft ([] on any failure) and cheap next to the two feed
+            # fetches above -- just refreshes the picker's dropdown, so a
+            # miss here shouldn't take down the actual check.
+            self._last_known_versions = list_known_spt_versions()
             known = self.state.get("mods", {})
             first_run = len(known) == 0
             prev_versions = {link: m.get("version", "") for link, m in known.items()}
@@ -590,6 +745,14 @@ class SPTCheckerApp:
         self._forge_dot.configure(fg=ACCENT_NEW)
         now = datetime.now().strftime("%H:%M:%S")
         total = len(self.state.get("mods", {}))
+
+        self._update_filter_labels(self._last_target_version, self._last_version_source)
+        if self._auto_detect_var.get():
+            # Reflect what was actually detected/used, not the last pick --
+            # the menu is disabled while auto is on, so this is
+            # display-only and doesn't fight a manual choice made earlier.
+            self._target_version_var.set(self._last_target_version or _UNFILTERED_CHOICE)
+        self._refresh_version_choices(getattr(self, "_last_known_versions", []))
 
         self._new_sig = self._render_column(
             self._new_frame, display_new, self._new_sig, first_run,

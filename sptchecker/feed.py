@@ -12,8 +12,9 @@ from .config import (
     API_MOD_URL, API_MODS_UPDATES_URL, API_URL, APP_VERSION, DC_NS, FEED_URL,
     FEED_UPDATED_URL, MODS_UPDATES_CHUNK_SIZE,
     PUBLISHED_CHUNK_SIZE as _PUBLISHED_CHUNK_SIZE,
+    DEFAULT_TARGET_SPT_VERSION,
 )
-from .utils import parse_dt
+from .utils import parse_dt, parse_version, spt_constraint_floor, spt_constraint_matches
 
 # Sort fallback for an entry with a missing or unparseable timestamp: sorts to
 # the bottom rather than raising or landing arbitrarily among real dates.
@@ -206,11 +207,43 @@ def _truncate(text, limit):
     return cut.rstrip() + "…"
 
 
-def _parse_api_mod(item):
+def _best_compatible_version(versions, target_spt_version):
+    """Of `versions` (a mod's full version history, newest first as the
+    Forge returns it), the highest-versioned entry whose
+    spt_version_constraint covers `target_spt_version` -- or None if the
+    mod has never published one.
+
+    Deliberately re-ranks by the version *number* rather than trusting the
+    Forge's own ordering: that ordering is by publish date, and a mod that
+    back-ported a fix to an older SPT line after already shipping a newer
+    SPT-only release would otherwise have the back-port passed over.
+    """
+    best, best_key = None, None
+    for v in versions:
+        if not spt_constraint_matches(v.get("spt_version_constraint"), target_spt_version):
+            continue
+        key = parse_version(v.get("version", ""))
+        if key is None:
+            continue
+        if best_key is None or key > best_key:
+            best_key, best = key, v
+    return best
+
+
+def _parse_api_mod(item, version=None):
     """Map a raw /api/v0/mods item (as returned with include=versions,category) to
-    this app's internal mod dict shape."""
+    this app's internal mod dict shape.
+
+    `version` is the specific version entry to surface as this mod's
+    "version"/"changelog"/"updated" -- normally the one a caller selected
+    for SPT-compatibility (see _best_compatible_version). Callers that don't
+    care about compatibility (e.g. local-mod matching, which checks
+    compatibility separately via the authoritative /mods/updates endpoint)
+    can omit it, and get the Forge's own newest entry -- unchanged from
+    this function's original behaviour.
+    """
     versions = item.get("versions", [])
-    latest = versions[0] if versions else {}
+    latest = version if version is not None else (versions[0] if versions else {})
     owner = item.get("owner") or {}
     category = item.get("category") or {}
 
@@ -233,7 +266,7 @@ def _parse_api_mod(item):
     }
 
 
-def _fetch_mods(params, timeout=15):
+def _fetch_mods(params, timeout=15, target_spt_version=None):
     """Fetch and parse one page of mods from the API; [] on any failure,
     matching this module's fail-soft convention.
 
@@ -243,21 +276,66 @@ def _fetch_mods(params, timeout=15):
     equally, and degrading it to [] would present a site-wide outage as "no
     mods found"; a rate limit means the answer is unknown, and local-mod
     matching has to be able to tell that apart from a genuine miss.
+
+    When `target_spt_version` is given, a mod is included only if it has a
+    published version compatible with it (see _best_compatible_version), and
+    that version -- not the Forge's own newest -- is what gets surfaced as
+    the mod's displayed version/changelog. Callers that need identity
+    lookups regardless of compatibility (local-mod matching) leave this None.
     """
     try:
         resp = _forge_request("get", API_URL, params={"include": "versions,category", **params},
                               headers=_API_HEADERS, timeout=timeout)
         resp.raise_for_status()
-        return [_parse_api_mod(item) for item in resp.json().get("data", [])]
+        items = resp.json().get("data", [])
+        if target_spt_version is None:
+            return [_parse_api_mod(item) for item in items]
+        mods = []
+        for item in items:
+            best = _best_compatible_version(item.get("versions", []), target_spt_version)
+            if best is not None:
+                mods.append(_parse_api_mod(item, version=best))
+        return mods
     except (ForgeBlocked, ForgeRateLimited):
         raise
     except Exception:
         return []
 
 
-def _fetch_api_mods(sort="-updated_at"):
+def _fetch_api_mods(sort="-updated_at", target_spt_version=None):
     """Fetch mods from the API with the given sort order."""
-    return _fetch_mods({"sort": sort, "per_page": 50}, timeout=30)
+    return _fetch_mods({"sort": sort, "per_page": 50}, timeout=30,
+                       target_spt_version=target_spt_version)
+
+
+def list_known_spt_versions(sample_size=50):
+    """Distinct SPT versions currently declared compatible by at least one
+    published version of at least one mod on the Forge -- the lower bound
+    of each version's spt_version_constraint, across a sample of the most
+    recently updated mods. Powers the target-version picker with live data
+    instead of a hardcoded, staleness-prone list of SPT's own release
+    history: as soon as mods start targeting a new SPT release, it appears
+    here on its own, and an old line drops off once nothing recent still
+    supports it. Sorted newest first. [] on any failure -- callers should
+    keep whatever choice list they already have rather than treat this as
+    "no versions exist".
+    """
+    try:
+        resp = _forge_request("get", API_URL,
+                              params={"include": "versions", "sort": "-updated_at",
+                                      "per_page": sample_size},
+                              headers=_API_HEADERS, timeout=20)
+        resp.raise_for_status()
+        items = resp.json().get("data", [])
+    except Exception:
+        return []
+    seen = set()
+    for item in items:
+        for v in item.get("versions", []):
+            floor = spt_constraint_floor(v.get("spt_version_constraint"))
+            if floor:
+                seen.add(floor)
+    return sorted(seen, key=parse_version, reverse=True)
 
 
 def lookup_by_guid(guid):
@@ -512,16 +590,38 @@ def _merge_api_first(api_mods, rss_mods):
     return merged
 
 
-def fetch_feeds():
-    """Fetch newest and recently updated mods from RSS feeds + API."""
-    api_updated = _fetch_api_mods(sort="-updated_at")
-    api_newest = _fetch_api_mods(sort="-created_at")
+def fetch_feeds(target_spt_version=None):
+    """Fetch newest and recently updated mods from RSS feeds + API.
 
-    # Either source going missing degrades to the other rather than blanking a
-    # column: a feed failure used to empty "new mods" outright, even with API
-    # results already in hand.
-    rss_newest = _parse_rss(FEED_URL)
-    rss_updated = _parse_rss(FEED_UPDATED_URL)
+    `target_spt_version`, when truthy, filters both columns to mods with a
+    version compatible with it (see _best_compatible_version) -- omit it (or
+    pass None) to fall back to DEFAULT_TARGET_SPT_VERSION, or pass ""
+    explicitly to disable filtering outright and show every mod's actual
+    newest version, same as upstream. A caller (the app's header picker) is
+    expected to resolve the real target -- manual entry or auto-detected from
+    an install folder -- and pass it in explicitly on every check.
+    """
+    effective = target_spt_version if target_spt_version is not None else DEFAULT_TARGET_SPT_VERSION
+    # "" collapses to None here, same as never passing a target -- both mean
+    # "don't filter" to _fetch_mods, which only special-cases None.
+    filter_arg = effective or None
+
+    api_updated = _fetch_api_mods(sort="-updated_at", target_spt_version=filter_arg)
+    api_newest = _fetch_api_mods(sort="-created_at", target_spt_version=filter_arg)
+
+    # RSS entries carry no per-version spt_version_constraint data at all, so
+    # there's nothing to check them against -- merging one in under a version
+    # filter would silently let an unverified (possibly incompatible) mod
+    # through. Skip RSS entirely while filtering is on and rely on the API's
+    # own fetched window; with it off, behave exactly as before.
+    if filter_arg:
+        rss_newest, rss_updated = [], []
+    else:
+        # Either source going missing degrades to the other rather than
+        # blanking a column: a feed failure used to empty "new mods"
+        # outright, even with API results already in hand.
+        rss_newest = _parse_rss(FEED_URL)
+        rss_updated = _parse_rss(FEED_UPDATED_URL)
     newest = _merge_api_first(api_newest, rss_newest)
 
     # RSS entries lack several API-only fields -- build per-link lookups from the

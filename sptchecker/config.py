@@ -32,6 +32,18 @@ FORGE_MOD_PAGE = "https://sp-mod.com/mod/2921/sptchecker"
 # nothing -- against a host that meters us and asked us to ease off.
 UPDATE_CHECK_INTERVAL_HOURS = 6
 
+# ── SPT version filter ──────────────────────────────────────────────────
+
+# Only mods with a version whose spt_version_constraint (as published by the
+# Forge) covers the target SPT version are shown in the New/Recently Updated
+# feed. This is just the seed value for a fresh install (state.json has none
+# yet) -- the app's header picker lets the target be changed, or set to
+# auto-detect from the Local Mods folder, at runtime; see app.py's
+# _resolve_target_spt_version. Overridable without touching source via the
+# SPTCHECKER_TARGET_SPT_VERSION env var. Falsy (empty string) disables
+# filtering and shows every mod's actual latest version, unfiltered.
+DEFAULT_TARGET_SPT_VERSION = os.environ.get("SPTCHECKER_TARGET_SPT_VERSION", "4.0.13")
+
 # ── Feed ───────────────────────────────────────────────────────────────
 
 FEED_URL = "https://sp-mod.com/mods/rss"
